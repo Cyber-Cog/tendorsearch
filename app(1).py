@@ -60,11 +60,30 @@ TENDER_KEYWORDS = [
 TECHNOLOGY_MAP = {
     "Solar": ["solar", "pv", "photovoltaic", "solar park", "rooftop", "kwp", "mwp"],
     "Wind": ["wind", "wtg", "turbine", "offshore wind", "onshore wind"],
-    "BESS": ["bess", "battery", "energy storage", "storage system", "pumped storage", "psp"],
+    # NOTE: 'psp' deliberately removed -- it is a substring of 'PSPCL' and caused
+    # mass false-positive BESS tags. Use explicit pumped-storage phrases instead.
+    "BESS": ["bess", "battery", "energy storage", "storage system", "pumped storage",
+             "pumped hydro", "battery energy storage"],
     "Hybrid": ["hybrid", "wind-solar", "solar-wind", "round the clock", "rtc", "firm power"],
-    "Transmission": ["transmission", "substation", "grid", "evacuation", "line", "kv", "gss"],
-    "EPC": ["epc", "engineering procurement", "balance of plant", "bop", "construction", "o&m", "operation and maintenance"],
+    "Transmission": ["transmission", "substation", "evacuation", "transmission line",
+                     "kv", "gss", "switchyard", "power grid"],
+    "EPC": ["epc", "engineering procurement", "balance of plant", "bop",
+            "operation and maintenance", "o&m"],
 }
+
+# Titles matching these are administrative / HR / non-procurement and are dropped
+# when the "Exclude non-tender content" toggle is on. This removes recruitment
+# notices, holiday lists, transfer orders, results, etc.
+NON_TENDER_KEYWORDS = [
+    "recruitment", "recruit", "vacancy", "vacancies", "appointment", "post of",
+    "posts of", "holiday list", "transfer", "promotion", "answer key", "syllabus",
+    "interview", "merit list", "seniority", "deputation", "apprentice",
+    "apprenticeship", "blacklisting", "blacklist", "defaulter", "tableau",
+    "republic day", "biometric", "document verification", "screening of candidates",
+    "shortlisted", "pension", "obituary", "office order", "pay scale",
+    "selection list", "waiting list", "advertisement for the post",
+    "employment notification", "result of",
+]
 
 # Regex patterns for structured extraction.
 RE_TENDER_NO = re.compile(
@@ -240,16 +259,63 @@ def _clean(text):
     return re.sub(r"\s+", " ", (text or "")).strip()
 
 
+# Cache of compiled, word-boundary keyword patterns. Boundary matching is the
+# core fix for false positives like 'psp' matching 'PSPCL' or 'line' matching
+# 'online'. \b ensures the keyword is a standalone token, not a substring.
+_KW_CACHE = {}
+
+
+def kw_in_text(text, keyword):
+    """True only if `keyword` appears as a whole word/phrase in `text`."""
+    if not text or not keyword:
+        return False
+    kw = keyword.lower().strip()
+    pat = _KW_CACHE.get(kw)
+    if pat is None:
+        # \b works for alphanumerics; for tokens with symbols (o&m, wind-solar)
+        # use explicit non-word-char lookarounds so boundaries still hold.
+        if re.search(r"[^\w\s]", kw):
+            pat = re.compile(r"(?<![\w])" + re.escape(kw) + r"(?![\w])")
+        else:
+            pat = re.compile(r"\b" + re.escape(kw) + r"\b")
+        _KW_CACHE[kw] = pat
+    return bool(pat.search(text.lower()))
+
+
 def _looks_like_tender(text):
-    low = (text or "").lower()
-    return any(kw in low for kw in TENDER_KEYWORDS)
+    return any(kw_in_text(text, kw) for kw in TENDER_KEYWORDS)
+
+
+def is_noise(text):
+    """True if the text is administrative / HR / non-procurement content."""
+    return any(kw_in_text(text, kw) for kw in NON_TENDER_KEYWORDS)
+
+
+# Procurement action phrases -- their presence is strong evidence of a real
+# tender as opposed to a news headline or navigation link.
+PROCUREMENT_VERBS = [
+    "supply of", "supply and", "supply, installation", "procurement of",
+    "construction of", "erection", "commissioning", "installation of",
+    "rate contract", "annual maintenance", "amc", "hiring of",
+    "selection of", "empanelment", "expression of interest",
+    "request for proposal", "request for selection", "invites bids",
+    "invites tender", "invitation of bids", "design, build",
+]
+
+
+def has_tender_signal(text):
+    """True if the text shows an explicit tender/procurement signal."""
+    if _looks_like_tender(text):
+        return True
+    if extract_tender_number(text):
+        return True
+    return any(kw_in_text(text, v) for v in PROCUREMENT_VERBS)
 
 
 def classify_technology(text):
-    low = (text or "").lower()
     hits = []
     for tech, words in TECHNOLOGY_MAP.items():
-        if any(w in low for w in words):
+        if any(kw_in_text(text, w) for w in words):
             hits.append(tech)
     return ", ".join(hits) if hits else "General"
 
@@ -280,13 +346,11 @@ def classify_tender_type(text):
 
 def compute_match_score(text, keywords, tech_filters):
     """0-100 relevance score from keyword + technology + tender-signal hits."""
-    low = (text or "").lower()
     score = 0
-    if _looks_like_tender(low):
+    if _looks_like_tender(text):
         score += 20
     for kw in keywords:
-        kw = kw.strip().lower()
-        if kw and kw in low:
+        if kw_in_text(text, kw):
             score += 15
     techs = classify_technology(text).split(", ")
     if tech_filters:
@@ -302,6 +366,8 @@ def compute_match_score(text, keywords, tech_filters):
         score += 10
     if any(d for d in extract_dates(text)):
         score += 5
+    if is_noise(text):
+        score -= 40
     return max(0, min(100, score))
 
 
@@ -380,12 +446,34 @@ def strategy_text_blocks(soup, source, base_url, keywords, tech_filters):
     return out
 
 
-def extract_tenders(html, source, base_url, keywords, tech_filters, debug=False):
+def _passes_filters(rec, tech_filters, strict_tech, exclude_noise, require_signal=False):
+    """Apply technology gate + non-tender exclusion + signal requirement."""
+    title = rec.get("Tender Title", "")
+    if exclude_noise and is_noise(title):
+        return False
+    if require_signal and not has_tender_signal(title):
+        return False
+    if strict_tech and tech_filters:
+        techs = [t.strip() for t in str(rec.get("Technology", "")).split(",")]
+        if not any(t in tech_filters for t in techs):
+            return False
+    return True
+
+
+def extract_tenders(html, source, base_url, keywords, tech_filters,
+                    strict_tech=True, exclude_noise=True, require_signal=False,
+                    debug=False):
     """
-    Run all extraction strategies, dedupe, and return (records, debug_info).
-    debug_info contains per-strategy counts + previews when debug=True.
+    Run all extraction strategies, filter, dedupe, and return (records, debug_info).
+
+    strict_tech    -- drop records whose detected technology does not intersect
+                      the selected technologies (when any are selected).
+    exclude_noise  -- drop administrative / HR / non-procurement items.
+    require_signal -- drop items lacking an explicit tender/procurement signal
+                      (removes news headlines and navigation links).
     """
-    debug_info = {"strategies": {}, "html_preview": "", "text_preview": "", "links": []}
+    debug_info = {"strategies": {}, "html_preview": "", "text_preview": "",
+                  "links": [], "filtered_out": 0}
     if not html:
         return [], debug_info
 
@@ -411,6 +499,11 @@ def extract_tenders(html, source, base_url, keywords, tech_filters, debug=False)
         seen.add(key)
         deduped.append(rec)
 
+    # Apply technology gate + non-tender exclusion.
+    kept = [r for r in deduped
+            if _passes_filters(r, tech_filters, strict_tech, exclude_noise, require_signal)]
+    debug_info["filtered_out"] = len(deduped) - len(kept)
+
     if debug:
         debug_info["html_preview"] = html[:3000]
         debug_info["text_preview"] = _clean(soup.get_text())[:3000]
@@ -418,13 +511,14 @@ def extract_tenders(html, source, base_url, keywords, tech_filters, debug=False)
             urljoin(base_url, a["href"]) for a in soup.find_all("a", href=True)
         ][:50]
 
-    return deduped, debug_info
+    return kept, debug_info
 
 # ---------------------------------------------------------------------------
 # PER-SOURCE SCAN  (runs inside worker thread; returns plain dict only)
 # ---------------------------------------------------------------------------
 
-def scan_source(source, keywords, tech_filters, timeout, retries, debug):
+def scan_source(source, keywords, tech_filters, timeout, retries, debug,
+                strict_tech=True, exclude_noise=True, require_signal=False):
     """Fetch + extract a single source. Returns a fully-populated record dict."""
     log_lines = [f"[START] {source['name']}"]
     record = {
@@ -471,7 +565,8 @@ def scan_source(source, keywords, tech_filters, timeout, retries, debug):
     try:
         tenders, dbg = extract_tenders(
             fetched["html"], source, fetched["final_url"],
-            keywords, tech_filters, debug=debug,
+            keywords, tech_filters, strict_tech=strict_tech,
+            exclude_noise=exclude_noise, require_signal=require_signal, debug=debug,
         )
         record["tenders"] = tenders
         record["tender_count"] = len(tenders)
@@ -611,6 +706,21 @@ def sidebar_controls():
         "Transmission": cols[1].checkbox("Transmission", value=False),
     }
     tech_filters = [t for t, on in flags.items() if on]
+    strict_tech = st.sidebar.checkbox(
+        "Strict technology filter (drop non-matching)", value=True,
+        help="When on, only tenders whose detected technology matches a ticked "
+             "box above are kept. Turn off to keep everything and rank by score.",
+    )
+    exclude_noise = st.sidebar.checkbox(
+        "Exclude non-tender content (HR/notices)", value=True,
+        help="Drops recruitment ads, holiday lists, transfer/result notices, etc.",
+    )
+    require_signal = st.sidebar.checkbox(
+        "Require explicit tender signal", value=True,
+        help="Keeps only items with a tender keyword, tender number, or procurement "
+             "verb (e.g. 'supply of'). Removes news headlines and nav links from "
+             "corporate sites. Turn off if it filters out real tenders you expect.",
+    )
 
     st.sidebar.subheader("Performance & Behaviour")
     deep_scan = st.sidebar.toggle("Deep Scan (follow detail pages)", value=False)
@@ -625,6 +735,9 @@ def sidebar_controls():
         "selected_sources": selected_sources,
         "keywords": keywords,
         "tech_filters": tech_filters,
+        "strict_tech": strict_tech,
+        "exclude_noise": exclude_noise,
+        "require_signal": require_signal,
         "deep_scan": deep_scan,
         "max_detail": max_detail,
         "timeout": timeout,
@@ -689,6 +802,7 @@ def run_scan(cfg, log_placeholder, progress_bar, status_text):
             pool.submit(
                 scan_source, s, cfg["keywords"], cfg["tech_filters"],
                 cfg["timeout"], cfg["retries"], cfg["debug"],
+                cfg["strict_tech"], cfg["exclude_noise"], cfg["require_signal"],
             ): s
             for s in sources
         }
