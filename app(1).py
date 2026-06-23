@@ -530,6 +530,18 @@ def run_validation(sources, timeout, workers):
 # STYLING HELPERS
 # ---------------------------------------------------------------------------
 
+def style_cells(df, func, subset):
+    """Apply a cell-styling function across pandas versions.
+
+    pandas >= 2.1 / 3.0 renamed Styler.applymap -> Styler.map (applymap removed
+    in 3.0). This helper uses whichever is available.
+    """
+    styler = df.style
+    if hasattr(styler, "map"):
+        return styler.map(func, subset=subset)
+    return styler.applymap(func, subset=subset)
+
+
 def color_health(val):
     mapping = {
         "Success": "background-color: #1e7d32; color: white;",
@@ -781,7 +793,7 @@ def render_health(health_df):
     if health_df is None or health_df.empty:
         st.info("No scan run yet.")
         return
-    styled = health_df.style.applymap(color_health, subset=["Health"])
+    styled = style_cells(health_df, color_health, subset=["Health"])
     st.dataframe(styled, use_container_width=True, height=420)
 
 
@@ -898,7 +910,7 @@ def render_validation_tab(cfg):
         v[1].metric("Working", int((df["State"] == "Working").sum()))
         v[2].metric("Redirected", int((df["State"] == "Redirected").sum()))
         v[3].metric("Broken", int((df["State"] == "Broken").sum()))
-        styled = df.style.applymap(color_health, subset=["State"])
+        styled = style_cells(df, color_health, subset=["State"])
         st.dataframe(styled, use_container_width=True, height=480)
         st.download_button(
             "⬇️ Download Validation CSV",
