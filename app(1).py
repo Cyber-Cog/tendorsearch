@@ -1,808 +1,979 @@
+"""
+Renewable Tender Intelligence Platform
+=======================================
+A single-file Streamlit application that performs LIVE, PARALLEL scanning of
+Indian renewable-energy tender sources (Solar / Wind / BESS / Hybrid /
+Transmission / EPC) using only free tooling: requests + BeautifulSoup +
+pandas + concurrent.futures. No paid APIs, no database, no Selenium.
 
+Design philosophy: TOTAL TRANSPARENCY. Every source's HTTP status, response
+time, extraction outcome, tender count and exact exception is surfaced in the
+UI. Nothing is hidden behind a silent try/except.
+
+NOTE ON COVERAGE: The registry URLs below are best-effort entry points. Many
+Indian government e-procurement portals render via JavaScript, require session
+tokens / CAPTCHAs, or use POST-based search forms that pure HTTP scraping
+cannot reach. Such sources will appear as redirected / failed / zero-tender in
+the health table -- which is correct, honest reporting, not a bug. Verify and
+refine URLs/parsers per source against the live sites for best results.
+"""
+
+import io
 import re
-import json
 import time
-import math
-import hashlib
-import sqlite3
 import traceback
-from dataclasses import dataclass, asdict
-from datetime import datetime, date
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from requests.adapters import HTTPAdapter, Retry
 
-APP_NAME = "Renewable EPC Tender Radar"
-CACHE_DB = "tender_cache.sqlite3"
+# ---------------------------------------------------------------------------
+# CONSTANTS
+# ---------------------------------------------------------------------------
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36"
+APP_TITLE = "🔆 Renewable Tender Intelligence Platform"
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-IN,en;q=0.9",
+    "Connection": "keep-alive",
+}
+
+# Keywords used to detect tender-like content and to classify technology.
+TENDER_KEYWORDS = [
+    "tender", "tenders", "rfp", "rfq", "eoi", "bid", "bidding", "notice",
+    "nit", "procurement", "auction", "rfs", "request for proposal",
+    "request for selection", "invitation", "e-tender", "etender", "corrigendum",
+]
+
+TECHNOLOGY_MAP = {
+    "Solar": ["solar", "pv", "photovoltaic", "solar park", "rooftop", "kwp", "mwp"],
+    "Wind": ["wind", "wtg", "turbine", "offshore wind", "onshore wind"],
+    "BESS": ["bess", "battery", "energy storage", "storage system", "pumped storage", "psp"],
+    "Hybrid": ["hybrid", "wind-solar", "solar-wind", "round the clock", "rtc", "firm power"],
+    "Transmission": ["transmission", "substation", "grid", "evacuation", "line", "kv", "gss"],
+    "EPC": ["epc", "engineering procurement", "balance of plant", "bop", "construction", "o&m", "operation and maintenance"],
+}
+
+# Regex patterns for structured extraction.
+RE_TENDER_NO = re.compile(
+    r"\b([A-Z]{2,}[/_\-][A-Z0-9/_\-]{3,}\d|"
+    r"[A-Z0-9]{2,}[/][A-Z0-9/]{2,}[/]\d{2,4}|"
+    r"NIT[\s:/-]*[A-Z0-9/_\-]{3,})",
+    re.IGNORECASE,
+)
+RE_DATE = re.compile(
+    r"\b(\d{1,2}[\-/\.]\d{1,2}[\-/\.]\d{2,4}|"
+    r"\d{4}[\-/\.]\d{1,2}[\-/\.]\d{1,2}|"
+    r"\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4})\b",
+    re.IGNORECASE,
 )
 
-DEFAULT_TIMEOUT = 25
-MAX_WORKERS = 5
+# ---------------------------------------------------------------------------
+# SOURCE REGISTRY  (70+ sources; URLs are best-effort entry points)
+# ---------------------------------------------------------------------------
 
-RENEWABLE_KEYWORDS = [
-    "solar", "solar pv", "solar power", "floating solar", "rooftop solar",
-    "wind", "wind power", "hybrid", "bess", "battery energy storage",
-    "battery storage", "energy storage", "epc", "turnkey", "design supply installation",
-    "engineering procurement construction", "renewable", "pv", "ists", "auction",
-    "supply installation testing commissioning", "sitc"
+def _src(name, group, url):
+    return {"name": name, "group": group, "url": url}
+
+
+SOURCE_REGISTRY = [
+    # ---------------- CENTRAL ----------------
+    _src("SECI", "Central", "https://www.seci.co.in/view-tenders"),
+    _src("NTPC", "Central", "https://www.ntpctender.com/"),
+    _src("NHPC", "Central", "https://www.nhpcindia.com/en/tenders"),
+    _src("SJVN", "Central", "https://www.sjvn.nic.in/tender.htm"),
+    _src("NLC India", "Central", "https://www.nlcindia.in/website/English/tender.aspx"),
+    _src("POWERGRID", "Central", "https://www.powergrid.in/en/tenders"),
+    _src("RECPDCL", "Central", "https://www.recpdcl.in/tenders"),
+    _src("PFCCL", "Central", "https://pfcclindia.com/Home/Tenders"),
+    _src("CPPP", "Central", "https://eprocure.gov.in/cppp/latestactivetendersnew/cpppdata"),
+    _src("GeM", "Central", "https://bidplus.gem.gov.in/all-bids"),
+    _src("GAIL", "Central", "https://gailtenders.in/"),
+    _src("IOCL", "Central", "https://iocletenders.nic.in/nicgep/app"),
+    _src("BPCL", "Central", "https://bpcl.in/tenders"),
+    _src("HPCL", "Central", "https://etender.hpcl.co.in/"),
+    _src("ONGC", "Central", "https://etender.ongc.co.in/"),
+    _src("REC", "Central", "https://recindia.nic.in/tender"),
+    # ---------------- STATE UTILITIES ----------------
+    _src("GUVNL", "State Utility", "https://guvnl.com/Tenders"),
+    _src("GSECL", "State Utility", "https://gsecl.in/tender"),
+    _src("RVUNL", "State Utility", "https://energy.rajasthan.gov.in/rvunl"),
+    _src("RUVNL", "State Utility", "https://energy.rajasthan.gov.in/ruvnl"),
+    _src("MSEDCL", "State Utility", "https://www.mahadiscom.in/tenders/"),
+    _src("MAHAGENCO", "State Utility", "https://www.mahagenco.in/index.php/tenders"),
+    _src("APGENCO", "State Utility", "https://www.apgenco.gov.in/page?id=tenders"),
+    _src("APTRANSCO", "State Utility", "https://www.aptransco.co.in/tenders"),
+    _src("TSGENCO", "State Utility", "https://www.tsgenco.co.in/tenders.php"),
+    _src("TSTRANSCO", "State Utility", "https://tstransco.in/tenders.html"),
+    _src("KREDL", "State Utility", "https://kredlinfo.in/tenders.aspx"),
+    _src("KPCL", "State Utility", "https://karnatakapower.com/tenders"),
+    _src("BESCOM", "State Utility", "https://bescom.karnataka.gov.in/page/Tenders"),
+    _src("CESCOM", "State Utility", "https://cescmysore.org/tenders"),
+    _src("HESCOM", "State Utility", "https://hescom.karnataka.gov.in/page/Tenders"),
+    _src("GESCOM", "State Utility", "https://gescom.karnataka.gov.in/page/Tenders"),
+    _src("TNGECL", "State Utility", "https://www.tngecl.in/tenders"),
+    _src("TANGEDCO", "State Utility", "https://www.tangedco.gov.in/tenders.html"),
+    _src("WBSEDCL", "State Utility", "https://www.wbsedcl.in/irj/go/km/docs/internet/new_website/Tenders.html"),
+    _src("GRIDCO", "State Utility", "https://www.gridco.co.in/tender.php"),
+    _src("OPTCL", "State Utility", "https://www.optcl.co.in/Tender.aspx"),
+    _src("MPPMCL", "State Utility", "https://www.mppmcl.com/en/tender"),
+    _src("UPPCL", "State Utility", "https://www.uppcl.org/en/tenders"),
+    _src("HPGCL", "State Utility", "https://www.hpgcl.org.in/tenders"),
+    _src("PSPCL", "State Utility", "https://www.pspcl.in/tenders/"),
+    _src("JVVNL", "State Utility", "https://energy.rajasthan.gov.in/jvvnl"),
+    _src("AVVNL", "State Utility", "https://energy.rajasthan.gov.in/avvnl"),
+    _src("JDVVNL", "State Utility", "https://energy.rajasthan.gov.in/jdvvnl"),
+    # ---------------- STATE E-PROCUREMENT ----------------
+    _src("eProc Karnataka", "State eProc", "https://eproc.karnataka.gov.in/"),
+    _src("eProc Maharashtra", "State eProc", "https://mahatenders.gov.in/nicgep/app"),
+    _src("eProc Gujarat", "State eProc", "https://gswan.gov.in/"),
+    _src("eProc Rajasthan", "State eProc", "https://eproc.rajasthan.gov.in/nicgep/app"),
+    _src("eProc Telangana", "State eProc", "https://tender.telangana.gov.in/nicgep/app"),
+    _src("eProc Andhra Pradesh", "State eProc", "https://tender.apeprocurement.gov.in/"),
+    _src("eProc Tamil Nadu", "State eProc", "https://tntenders.gov.in/nicgep/app"),
+    _src("eProc Odisha", "State eProc", "https://tendersodisha.gov.in/nicgep/app"),
+    _src("eProc West Bengal", "State eProc", "https://wbtenders.gov.in/nicgep/app"),
+    _src("eProc Madhya Pradesh", "State eProc", "https://mptenders.gov.in/nicgep/app"),
+    _src("eProc Uttar Pradesh", "State eProc", "https://etender.up.nic.in/nicgep/app"),
+    _src("eProc Punjab", "State eProc", "https://eproc.punjab.gov.in/nicgep/app"),
+    _src("eProc Haryana", "State eProc", "https://etenders.hry.nic.in/nicgep/app"),
+    _src("eProc Chhattisgarh", "State eProc", "https://eproc.cgstate.gov.in/nicgep/app"),
+    _src("eProc Kerala", "State eProc", "https://etenders.kerala.gov.in/nicgep/app"),
+    _src("eProc Bihar", "State eProc", "https://eproc2.bihar.gov.in/EPSV2Web/"),
+    _src("eProc Assam", "State eProc", "https://assamtenders.gov.in/nicgep/app"),
+    _src("eProc Jharkhand", "State eProc", "https://jharkhandtenders.gov.in/nicgep/app"),
+    _src("eProc Uttarakhand", "State eProc", "https://uktenders.gov.in/nicgep/app"),
+    _src("eProc Himachal Pradesh", "State eProc", "https://hptenders.gov.in/nicgep/app"),
+    _src("eProc Delhi", "State eProc", "https://govtprocurement.delhi.gov.in/nicgep/app"),
+    # ---------------- PRIVATE DEVELOPERS ----------------
+    _src("Adani Green", "Private", "https://www.adanigreenenergy.com/tenders"),
+    _src("ReNew", "Private", "https://www.renew.com/"),
+    _src("ACME Solar", "Private", "https://www.acme.in/"),
+    _src("Avaada", "Private", "https://avaada.com/"),
+    _src("Ayana", "Private", "https://ayanapower.com/"),
+    _src("Juniper Green", "Private", "https://junipergreenenergy.com/"),
+    _src("Hero Future Energies", "Private", "https://www.herofutureenergies.com/"),
+    _src("O2 Power", "Private", "https://o2power.in/"),
+    _src("Torrent Power", "Private", "https://www.torrentpower.com/index.php/business/tender"),
+    _src("JSW Energy", "Private", "https://www.jsw.in/energy"),
 ]
 
-SOURCE_CONFIGS = [
-    {
-        "name": "SECI",
-        "kind": "seci",
-        "url": "https://www.seci.co.in/tenders",
-        "description": "Solar Energy Corporation of India live tenders",
-    },
-    {
-        "name": "NTPC",
-        "kind": "ntpc",
-        "url": "https://ntpctender.ntpc.co.in/Index/Search",
-        "description": "NTPC tender search portal",
-    },
-    {
-        "name": "NHPC",
-        "kind": "nhpc",
-        "url": "https://www.nhpcindia.com/welcome/tender",
-        "description": "NHPC live tender page",
-    },
-    {
-        "name": "SJVN",
-        "kind": "sjvn",
-        "url": "https://sjvn.nic.in/en/tender",
-        "description": "SJVN live tender page",
-    },
-    {
-        "name": "CPPP",
-        "kind": "cppp",
-        "url": "https://eprocure.gov.in/eprocure/app?page=WebTenderStatusLists&service=page",
-        "description": "Central Public Procurement Portal active tenders",
-    },
-]
+SOURCE_GROUPS = sorted({s["group"] for s in SOURCE_REGISTRY})
 
-@dataclass
-class Tender:
-    source: str
-    title: str
-    closing_date: str = ""
-    publish_date: str = ""
-    ref_no: str = ""
-    org: str = ""
-    location: str = ""
-    url: str = ""
-    summary: str = ""
-    score: int = 0
-    matched_keywords: str = ""
+# ---------------------------------------------------------------------------
+# NETWORKING
+# ---------------------------------------------------------------------------
 
-    def unique_key(self) -> str:
-        basis = "|".join(
-            [
-                self.source.strip().lower(),
-                self.title.strip().lower(),
-                self.ref_no.strip().lower(),
-                self.url.strip().lower(),
-            ]
-        )
-        return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+def build_session():
+    """Create a fresh, configured Session (one per worker thread for safety)."""
+    s = requests.Session()
+    s.headers.update(DEFAULT_HEADERS)
+    return s
 
-def init_page():
-    st.set_page_config(
-        page_title=APP_NAME,
-        page_icon="⚡",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-    st.title("⚡ Renewable EPC Tender Radar")
-    st.caption("Solar, Wind and BESS tender scanner across official public portals.")
 
-def get_session() -> requests.Session:
-    session = requests.Session()
-    retries = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=0.7,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET", "POST"]),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    session.headers.update(
-        {
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.8",
-            "Connection": "keep-alive",
-        }
-    )
-    return session
-
-def fetch_html(session: requests.Session, url: str, timeout: int = DEFAULT_TIMEOUT, method: str = "GET",
-               data: Optional[dict] = None, params: Optional[dict] = None) -> Tuple[str, str]:
-    resp = session.request(method=method, url=url, timeout=timeout, data=data, params=params)
-    resp.raise_for_status()
-    resp.encoding = resp.apparent_encoding or resp.encoding or "utf-8"
-    return resp.text, resp.url
-
-def soup_from_html(html: str) -> BeautifulSoup:
-    return BeautifulSoup(html, "html.parser")
-
-def clean_text(text: Optional[str]) -> str:
-    if not text:
-        return ""
-    text = re.sub(r"\s+", " ", text)
-    return text.replace("\xa0", " ").strip()
-
-def normalize_url(base: str, href: str) -> str:
-    if not href:
-        return ""
-    return urljoin(base, href)
-
-def maybe_abs_url(base: str, href_or_url: str) -> str:
-    if not href_or_url:
-        return ""
-    if href_or_url.startswith("http://") or href_or_url.startswith("https://"):
-        return href_or_url
-    return urljoin(base, href_or_url)
-
-def parse_date_any(value: str) -> str:
-    value = clean_text(value)
-    if not value:
-        return ""
-    candidates = [
-        "%d/%m/%Y",
-        "%d-%m-%Y",
-        "%d/%m/%y",
-        "%d-%m-%y",
-        "%Y-%m-%d",
-        "%d %b %Y",
-        "%d %B %Y",
-        "%d-%b-%Y",
-        "%d-%B-%Y",
-        "%d.%m.%Y",
-        "%d/%m/%Y %I:%M %p",
-        "%d-%m-%Y %I:%M %p",
-        "%Y/%m/%d",
-    ]
-    for fmt in candidates:
+def fetch_url(url, timeout, retries):
+    """
+    Fetch a URL with retry. Returns a dict that NEVER hides failures.
+    Keys: ok, status, elapsed, html, text, final_url, redirected, error, tb
+    """
+    result = {
+        "ok": False, "status": None, "elapsed": 0.0, "html": "", "text": "",
+        "final_url": url, "redirected": False, "error": "", "tb": "",
+    }
+    last_exc = None
+    start = time.time()
+    for attempt in range(max(1, retries + 1)):
+        sess = build_session()
         try:
-            dt = datetime.strptime(value, fmt)
-            return dt.strftime("%Y-%m-%d")
-        except Exception:
-            pass
-    m = re.search(r"(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})", value)
-    if m:
-        day, mon, year = m.groups()
-        try:
-            dt = datetime.strptime(f"{day} {mon} {year}", "%d %B %Y")
-            return dt.strftime("%Y-%m-%d")
-        except Exception:
+            resp = sess.get(url, timeout=timeout, allow_redirects=True)
+            result["status"] = resp.status_code
+            result["elapsed"] = round(time.time() - start, 3)
+            result["final_url"] = resp.url
+            result["redirected"] = (resp.url.rstrip("/") != url.rstrip("/"))
+            if resp.status_code == 200:
+                result["html"] = resp.text
+                result["ok"] = True
+            else:
+                result["error"] = f"HTTP {resp.status_code}"
+            return result
+        except requests.exceptions.Timeout as exc:
+            last_exc = exc
+            result["error"] = f"Timeout after {timeout}s"
+        except requests.exceptions.ConnectionError as exc:
+            last_exc = exc
+            result["error"] = "ConnectionError"
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            result["error"] = f"RequestException: {exc.__class__.__name__}"
+        except Exception as exc:  # truly unexpected -> still reported, not hidden
+            last_exc = exc
+            result["error"] = f"{exc.__class__.__name__}: {exc}"
+        finally:
             try:
-                dt = datetime.strptime(f"{day} {mon[:3]} {year}", "%d %b %Y")
-                return dt.strftime("%Y-%m-%d")
+                sess.close()
             except Exception:
                 pass
-    return value
+    result["elapsed"] = round(time.time() - start, 3)
+    if last_exc is not None:
+        result["tb"] = "".join(
+            traceback.format_exception(type(last_exc), last_exc, last_exc.__traceback__)
+        )
+    return result
 
-def contains_relevant_keywords(text: str, extra_keywords: List[str]) -> Tuple[int, List[str]]:
-    hay = (text or "").lower()
-    found = []
+# ---------------------------------------------------------------------------
+# EXTRACTION STRATEGIES
+# ---------------------------------------------------------------------------
+
+def _clean(text):
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def _looks_like_tender(text):
+    low = (text or "").lower()
+    return any(kw in low for kw in TENDER_KEYWORDS)
+
+
+def classify_technology(text):
+    low = (text or "").lower()
+    hits = []
+    for tech, words in TECHNOLOGY_MAP.items():
+        if any(w in low for w in words):
+            hits.append(tech)
+    return ", ".join(hits) if hits else "General"
+
+
+def extract_tender_number(text):
+    m = RE_TENDER_NO.search(text or "")
+    return _clean(m.group(0)) if m else ""
+
+
+def extract_dates(text):
+    found = RE_DATE.findall(text or "")
+    flat = []
+    for f in found:
+        flat.append(f if isinstance(f, str) else f[0])
+    flat = [d for d in flat if d]
+    issue = flat[0] if len(flat) >= 1 else ""
+    close = flat[1] if len(flat) >= 2 else ""
+    return issue, close
+
+
+def classify_tender_type(text):
+    low = (text or "").lower()
+    for t in ("corrigendum", "eoi", "rfp", "rfq", "rfs", "auction", "nit", "tender"):
+        if t in low:
+            return t.upper()
+    return "NOTICE"
+
+
+def compute_match_score(text, keywords, tech_filters):
+    """0-100 relevance score from keyword + technology + tender-signal hits."""
+    low = (text or "").lower()
     score = 0
-    for kw in extra_keywords:
-        k = kw.lower().strip()
-        if not k:
+    if _looks_like_tender(low):
+        score += 20
+    for kw in keywords:
+        kw = kw.strip().lower()
+        if kw and kw in low:
+            score += 15
+    techs = classify_technology(text).split(", ")
+    if tech_filters:
+        if any(t in tech_filters for t in techs):
+            score += 30
+        else:
+            score -= 10
+    else:
+        if techs != ["General"]:
+            score += 20
+    # mild boost for structured signals
+    if extract_tender_number(text):
+        score += 10
+    if any(d for d in extract_dates(text)):
+        score += 5
+    return max(0, min(100, score))
+
+
+def _make_record(source, title, url, raw_text, keywords, tech_filters):
+    issue, close = extract_dates(raw_text)
+    return {
+        "Source": source["name"],
+        "Tender Title": _clean(title)[:300],
+        "Tender Number": extract_tender_number(raw_text),
+        "Tender Type": classify_tender_type(raw_text),
+        "Technology": classify_technology(raw_text),
+        "Issue Date": issue,
+        "Closing Date": close,
+        "Location": source["group"],
+        "URL": url,
+        "Match Score": compute_match_score(raw_text, keywords, tech_filters),
+    }
+
+
+def strategy_tables(soup, source, base_url, keywords, tech_filters):
+    """Strategy 1: rows of HTML tables that look like tenders."""
+    out = []
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr"):
+            cells = row.find_all(["td", "th"])
+            if not cells:
+                continue
+            # Skip pure header rows (all <th>, no data cells).
+            if all(c.name == "th" for c in cells):
+                continue
+            row_text = " | ".join(_clean(c.get_text()) for c in cells)
+            if not row_text or not _looks_like_tender(row_text):
+                # still keep rows that carry technology signal
+                if classify_technology(row_text) == "General":
+                    continue
+            link = ""
+            a = row.find("a", href=True)
+            if a:
+                link = urljoin(base_url, a["href"])
+            title = _clean(a.get_text()) if a and _clean(a.get_text()) else row_text
+            out.append(_make_record(source, title, link or base_url, row_text, keywords, tech_filters))
+    return out
+
+
+def strategy_anchors(soup, source, base_url, keywords, tech_filters):
+    """Strategy 2: anchor tags whose text/href look tender-like."""
+    out = []
+    for a in soup.find_all("a", href=True):
+        atext = _clean(a.get_text())
+        href = a["href"]
+        combined = f"{atext} {href}"
+        if not _looks_like_tender(combined) and classify_technology(combined) == "General":
             continue
-        if k in hay:
-            found.append(kw)
-            score += max(1, len(k.split()))
-    return score, found
+        if len(atext) < 4:
+            continue
+        link = urljoin(base_url, href)
+        out.append(_make_record(source, atext, link, combined, keywords, tech_filters))
+    return out
 
-def should_keep_tender(t: Tender, include_closed: bool, query: str, min_score: int) -> bool:
-    blob = " ".join([t.title, t.ref_no, t.org, t.location, t.summary, t.source]).lower()
-    kw_score, found = contains_relevant_keywords(blob, [query] if query else [])
-    if query and query.lower() not in blob:
-        # query can be a fuzzy filter, not a strict must-have if sources are small
-        pass
-    t.score = max(t.score, kw_score)
-    t.matched_keywords = ", ".join(sorted(set([x for x in found if x]))) if found else t.matched_keywords
-    if t.score < min_score:
-        # Keep if source text strongly matches renewable terms even if score is low
-        renewable_score, renewable_found = contains_relevant_keywords(blob, RENEWABLE_KEYWORDS)
-        t.score = max(t.score, renewable_score)
-        if renewable_found:
-            t.matched_keywords = ", ".join(sorted(set(renewable_found)))
-    if t.score < min_score:
-        return False
-    if not include_closed and t.closing_date:
-        try:
-            c = datetime.strptime(t.closing_date[:10], "%Y-%m-%d").date()
-            if c < date.today():
-                return False
-        except Exception:
-            pass
-    return True
 
-def create_db():
-    conn = sqlite3.connect(CACHE_DB)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS tenders (
-            unique_key TEXT PRIMARY KEY,
-            payload TEXT NOT NULL,
-            fetched_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
+def strategy_text_blocks(soup, source, base_url, keywords, tech_filters):
+    """Strategy 3 + 4: list items / paragraphs + regex over visible text."""
+    out = []
+    for tag in soup.find_all(["li", "p", "div"]):
+        # only leaf-ish blocks to avoid huge containers
+        if tag.find(["li", "p", "div", "table"]):
+            continue
+        txt = _clean(tag.get_text())
+        if len(txt) < 8 or len(txt) > 400:
+            continue
+        if not _looks_like_tender(txt) and classify_technology(txt) == "General":
+            continue
+        a = tag.find("a", href=True)
+        link = urljoin(base_url, a["href"]) if a else base_url
+        out.append(_make_record(source, txt, link, txt, keywords, tech_filters))
+    return out
 
-def save_cache(rows: List[Tender]):
-    conn = sqlite3.connect(CACHE_DB)
-    now = datetime.utcnow().isoformat(timespec="seconds")
-    for t in rows:
-        conn.execute(
-            "INSERT OR REPLACE INTO tenders(unique_key, payload, fetched_at) VALUES (?, ?, ?)",
-            (t.unique_key(), json.dumps(asdict(t), ensure_ascii=False), now),
-        )
-    conn.commit()
-    conn.close()
 
-def load_cache() -> pd.DataFrame:
-    conn = sqlite3.connect(CACHE_DB)
+def extract_tenders(html, source, base_url, keywords, tech_filters, debug=False):
+    """
+    Run all extraction strategies, dedupe, and return (records, debug_info).
+    debug_info contains per-strategy counts + previews when debug=True.
+    """
+    debug_info = {"strategies": {}, "html_preview": "", "text_preview": "", "links": []}
+    if not html:
+        return [], debug_info
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    s1 = strategy_tables(soup, source, base_url, keywords, tech_filters)
+    s2 = strategy_anchors(soup, source, base_url, keywords, tech_filters)
+    s3 = strategy_text_blocks(soup, source, base_url, keywords, tech_filters)
+
+    debug_info["strategies"] = {
+        "tables": len(s1), "anchors": len(s2), "text_blocks": len(s3),
+    }
+
+    combined = s1 + s2 + s3
+
+    # Deduplicate on (normalized title, url)
+    seen = set()
+    deduped = []
+    for rec in combined:
+        key = (rec["Tender Title"].lower()[:120], rec["URL"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(rec)
+
+    if debug:
+        debug_info["html_preview"] = html[:3000]
+        debug_info["text_preview"] = _clean(soup.get_text())[:3000]
+        debug_info["links"] = [
+            urljoin(base_url, a["href"]) for a in soup.find_all("a", href=True)
+        ][:50]
+
+    return deduped, debug_info
+
+# ---------------------------------------------------------------------------
+# PER-SOURCE SCAN  (runs inside worker thread; returns plain dict only)
+# ---------------------------------------------------------------------------
+
+def scan_source(source, keywords, tech_filters, timeout, retries, debug):
+    """Fetch + extract a single source. Returns a fully-populated record dict."""
+    log_lines = [f"[START] {source['name']}"]
+    record = {
+        "source": source["name"],
+        "group": source["group"],
+        "url": source["url"],
+        "final_url": source["url"],
+        "status": None,
+        "status_label": "",
+        "response_time": 0.0,
+        "redirected": False,
+        "extraction_success": False,
+        "tender_count": 0,
+        "error": "",
+        "traceback": "",
+        "tenders": [],
+        "debug": {},
+        "log": log_lines,
+    }
+
+    fetched = fetch_url(source["url"], timeout=timeout, retries=retries)
+    record["status"] = fetched["status"]
+    record["response_time"] = fetched["elapsed"]
+    record["final_url"] = fetched["final_url"]
+    record["redirected"] = fetched["redirected"]
+    record["error"] = fetched["error"]
+    record["traceback"] = fetched["tb"]
+
+    if fetched["status"] is not None:
+        log_lines.append(f"[HTTP] {fetched['status']} ({fetched['elapsed']}s)")
+    else:
+        log_lines.append(f"[ERROR] {fetched['error']}")
+
+    if fetched["redirected"]:
+        log_lines.append(f"[REDIRECT] -> {fetched['final_url']}")
+
+    if not fetched["ok"]:
+        if fetched["error"].lower().startswith("timeout"):
+            log_lines.append("[TIMEOUT]")
+        log_lines.append("[DONE]")
+        record["status_label"] = "Failed"
+        return record
+
     try:
-        df = pd.read_sql_query("SELECT payload, fetched_at FROM tenders ORDER BY fetched_at DESC", conn)
-    except Exception:
-        df = pd.DataFrame(columns=["payload", "fetched_at"])
-    conn.close()
+        tenders, dbg = extract_tenders(
+            fetched["html"], source, fetched["final_url"],
+            keywords, tech_filters, debug=debug,
+        )
+        record["tenders"] = tenders
+        record["tender_count"] = len(tenders)
+        record["extraction_success"] = len(tenders) > 0
+        record["debug"] = dbg
+        log_lines.append(f"[PARSE] {len(tenders)} tenders")
+        if tenders:
+            record["status_label"] = "Success"
+        else:
+            record["status_label"] = "Partial"  # reached page, nothing extracted
+            log_lines.append("[WARN] page reached but 0 tenders extracted")
+    except Exception as exc:
+        record["error"] = f"ParseError: {exc.__class__.__name__}: {exc}"
+        record["traceback"] = traceback.format_exc()
+        record["status_label"] = "Failed"
+        log_lines.append(f"[ERROR] {record['error']}")
+
+    log_lines.append("[DONE]")
+    return record
+
+# ---------------------------------------------------------------------------
+# SOURCE VALIDATION (lightweight concurrent reachability check)
+# ---------------------------------------------------------------------------
+
+def validate_source(source, timeout):
+    fetched = fetch_url(source["url"], timeout=timeout, retries=0)
+    if fetched["status"] == 200 and fetched["redirected"]:
+        state = "Redirected"
+    elif fetched["status"] == 200:
+        state = "Working"
+    elif fetched["redirected"] and fetched["status"] in (301, 302, 303, 307, 308):
+        state = "Redirected"
+    else:
+        state = "Broken"
+    return {
+        "Source": source["name"],
+        "Group": source["group"],
+        "URL": source["url"],
+        "Status": fetched["status"],
+        "State": state,
+        "Final URL": fetched["final_url"],
+        "Time (s)": fetched["elapsed"],
+        "Error": fetched["error"],
+    }
+
+
+def run_validation(sources, timeout, workers):
     rows = []
-    for _, row in df.iterrows():
-        try:
-            payload = json.loads(row["payload"])
-            payload["cached_at"] = row["fetched_at"]
-            rows.append(payload)
-        except Exception:
-            continue
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(validate_source, s, timeout): s for s in sources}
+        for fut in as_completed(futures):
+            rows.append(fut.result())
     return pd.DataFrame(rows)
 
-def dedupe_tenders(tenders: List[Tender]) -> List[Tender]:
-    seen = set()
-    out = []
-    for t in tenders:
-        key = t.unique_key()
-        if key not in seen:
-            seen.add(key)
-            out.append(t)
-    return out
+# ---------------------------------------------------------------------------
+# STYLING HELPERS
+# ---------------------------------------------------------------------------
 
-def parse_tables_generic(html: str, base_url: str, source_name: str) -> List[Tender]:
-    out: List[Tender] = []
-    try:
-        tables = pd.read_html(html)
-    except Exception:
-        tables = []
-    for df in tables:
-        if df.empty:
-            continue
-        df = df.fillna("")
-        cols = [str(c).strip().lower() for c in df.columns]
-        for _, r in df.iterrows():
-            values = [clean_text(str(v)) for v in r.tolist() if clean_text(str(v))]
-            if not values:
-                continue
-            joined = " | ".join(values)
-            if len(joined) < 20:
-                continue
-            title = ""
-            closing = ""
-            publish = ""
-            ref_no = ""
-            org = ""
-            location = ""
-            url = base_url
+def color_health(val):
+    mapping = {
+        "Success": "background-color: #1e7d32; color: white;",
+        "Partial": "background-color: #b8860b; color: white;",
+        "Failed": "background-color: #b71c1c; color: white;",
+        "Working": "background-color: #1e7d32; color: white;",
+        "Redirected": "background-color: #b8860b; color: white;",
+        "Broken": "background-color: #b71c1c; color: white;",
+    }
+    return mapping.get(val, "")
 
-            for v in values:
-                if not title and len(v) > 10 and not re.search(r"\b(20\d{2}[-/]\d{2}[-/]\d{2}|\d{2}[-/]\d{2}[-/]\d{4})\b", v):
-                    title = v
-                if not closing:
-                    m = re.search(r"\b(\d{2}[-/]\d{2}[-/]\d{4}|\d{2}[-/]\d{2}[-/]\d{2}|\d{4}[-/]\d{2}[-/]\d{2})\b", v)
-                    if m:
-                        closing = parse_date_any(m.group(1))
-                if not ref_no and re.search(r"[A-Z0-9][A-Z0-9\-/_.]{5,}", v):
-                    ref_no = v[:120]
-            if not title:
-                title = values[0]
-            out.append(
-                Tender(
-                    source=source_name,
-                    title=clean_text(title),
-                    closing_date=clean_text(closing),
-                    publish_date=clean_text(publish),
-                    ref_no=clean_text(ref_no),
-                    org=clean_text(org),
-                    location=clean_text(location),
-                    url=url,
-                    summary=clean_text(joined),
-                )
-            )
-    return out
 
-def scrape_seci(session: requests.Session) -> List[Tender]:
-    html, final_url = fetch_html(session, "https://www.seci.co.in/tenders")
-    soup = soup_from_html(html)
-    text = clean_text(soup.get_text(" ", strip=True))
-    rows = []
-    # table-based parsing
-    rows.extend(parse_tables_generic(html, final_url, "SECI"))
-
-    # direct link parsing for details pages
-    for a in soup.find_all("a", href=True):
-        href = a.get("href", "")
-        label = clean_text(a.get_text(" ", strip=True))
-        if not label and not href:
-            continue
-        full = maybe_abs_url(final_url, href)
-        if "tender" not in full.lower() and "detail" not in full.lower():
-            continue
-        if any(x in (label + " " + full).lower() for x in ["solar", "wind", "bess", "hybrid", "epc", "renewable", "storage"]):
-            rows.append(
-                Tender(
-                    source="SECI",
-                    title=label if label else "SECI Tender",
-                    url=full,
-                    summary=label or full,
-                )
-            )
-
-    # regex over plain text as fallback
-    pattern = re.compile(
-        r"(SECI\d{3,}.*?)(?:View Details|$)",
-        re.IGNORECASE | re.DOTALL,
-    )
-    for m in pattern.finditer(text):
-        seg = clean_text(m.group(1))
-        if len(seg) < 15:
-            continue
-        if any(k in seg.lower() for k in ["solar", "wind", "bess", "hybrid", "epc", "renewable"]):
-            rows.append(Tender(source="SECI", title=seg, summary=seg, url=final_url))
-    return dedupe_tenders(rows)
-
-def scrape_ntpc(session: requests.Session) -> List[Tender]:
-    html, final_url = fetch_html(session, "https://ntpctender.ntpc.co.in/Index/Search")
-    soup = soup_from_html(html)
-    rows: List[Tender] = []
-    rows.extend(parse_tables_generic(html, final_url, "NTPC"))
-
-    text = clean_text(soup.get_text(" ", strip=True))
-    # Patterns like: code title unit date
-    # Split by known tender code formats
-    snippets = re.split(r"\s{2,}|\n+", text)
-    for sn in snippets:
-        sn = clean_text(sn)
-        if len(sn) < 20:
-            continue
-        low = sn.lower()
-        if any(k in low for k in ["solar", "wind", "bess", "battery", "hybrid", "renewable", "epc", "power"]):
-            code = ""
-            m = re.search(r"\b([A-Z]{1,6}-?\d{1,5}-?\d{0,8}(?:/[A-Z0-9\-]+)?)\b", sn)
-            if m:
-                code = m.group(1)
-            rows.append(
-                Tender(
-                    source="NTPC",
-                    title=sn[:220],
-                    ref_no=code,
-                    url=final_url,
-                    summary=sn,
-                )
-            )
-
-    # Follow obvious tender detail links
-    for a in soup.find_all("a", href=True):
-        label = clean_text(a.get_text(" ", strip=True))
-        href = maybe_abs_url(final_url, a["href"])
-        blob = f"{label} {href}".lower()
-        if any(k in blob for k in ["solar", "wind", "bess", "battery", "hybrid", "epc", "renewable"]):
-            rows.append(
-                Tender(
-                    source="NTPC",
-                    title=label or "NTPC Tender",
-                    url=href,
-                    summary=label or href,
-                )
-            )
-    return dedupe_tenders(rows)
-
-def scrape_nhpc(session: requests.Session) -> List[Tender]:
-    html, final_url = fetch_html(session, "https://www.nhpcindia.com/welcome/tender")
-    soup = soup_from_html(html)
-    text = clean_text(soup.get_text(" ", strip=True))
-    rows: List[Tender] = []
-    rows.extend(parse_tables_generic(html, final_url, "NHPC"))
-
-    # NHPC pages commonly expose label-value blocks
-    block_pattern = re.compile(
-        r"Tender Title\s*:\s*(?P<title>.*?)\s*NIT No\.?\s*:\s*(?P<nit>.*?)\s*(?:Location\s*:\s*(?P<loc>.*?))?(?:\s*View More|\s*View Details|$)",
-        re.IGNORECASE | re.DOTALL,
-    )
-    for m in block_pattern.finditer(text):
-        title = clean_text(m.group("title"))
-        nit = clean_text(m.group("nit"))
-        loc = clean_text(m.group("loc"))
-        if not title:
-            continue
-        rows.append(
-            Tender(
-                source="NHPC",
-                title=title,
-                ref_no=nit,
-                location=loc,
-                url=final_url,
-                summary=" ".join([title, nit, loc]),
-            )
-        )
-
-    # Any link with "tender_detail" can be useful
-    for a in soup.find_all("a", href=True):
-        href = maybe_abs_url(final_url, a["href"])
-        label = clean_text(a.get_text(" ", strip=True))
-        blob = f"{label} {href}".lower()
-        if "tender_detail" in href.lower() or any(k in blob for k in ["solar", "wind", "bess", "epc", "renewable"]):
-            rows.append(
-                Tender(
-                    source="NHPC",
-                    title=label or "NHPC Tender",
-                    url=href,
-                    summary=label or href,
-                )
-            )
-    return dedupe_tenders(rows)
-
-def scrape_sjvn(session: requests.Session) -> List[Tender]:
-    html, final_url = fetch_html(session, "https://sjvn.nic.in/en/tender")
-    soup = soup_from_html(html)
-    text = clean_text(soup.get_text(" ", strip=True))
-    rows: List[Tender] = []
-    rows.extend(parse_tables_generic(html, final_url, "SJVN"))
-
-    # Extract repeated tender blocks using labels visible in page text
-    # Works for both direct and paginated tender listings.
-    block_re = re.compile(
-        r"Tender Title\s*:\s*(?P<title>.*?)\s*(?:Location\s*:\s*(?P<loc>.*?))?\s*(?:NIT Date\s*:\s*(?P<nitdate>.*?))?\s*(?:Last Date of Submission\s*:\s*(?P<last>.*?))?\s*(?:View Tender Details|$)",
-        re.IGNORECASE | re.DOTALL,
-    )
-    for m in block_re.finditer(text):
-        title = clean_text(m.group("title"))
-        if not title:
-            continue
-        loc = clean_text(m.group("loc"))
-        nitdate = parse_date_any(clean_text(m.group("nitdate")))
-        last = parse_date_any(clean_text(m.group("last")))
-        rows.append(
-            Tender(
-                source="SJVN",
-                title=title,
-                closing_date=last,
-                publish_date=nitdate,
-                location=loc,
-                url=final_url,
-                summary=" ".join(filter(None, [title, loc, nitdate, last])),
-            )
-        )
-
-    for a in soup.find_all("a", href=True):
-        href = maybe_abs_url(final_url, a["href"])
-        label = clean_text(a.get_text(" ", strip=True))
-        blob = f"{label} {href}".lower()
-        if "tender" in blob and any(k in blob for k in ["solar", "wind", "bess", "epc", "renewable", "hybrid"]) :
-            rows.append(
-                Tender(
-                    source="SJVN",
-                    title=label or "SJVN Tender",
-                    url=href,
-                    summary=label or href,
-                )
-            )
-    return dedupe_tenders(rows)
-
-def scrape_cppp(session: requests.Session) -> List[Tender]:
-    html, final_url = fetch_html(session, "https://eprocure.gov.in/eprocure/app?page=WebTenderStatusLists&service=page")
-    soup = soup_from_html(html)
-    rows: List[Tender] = []
-    rows.extend(parse_tables_generic(html, final_url, "CPPP"))
-
-    text = clean_text(soup.get_text(" ", strip=True))
-    # Capture title in brackets followed by tender id/org chain
-    bracket_rows = re.findall(
-        r"\[(?P<title>[^\]]{20,300})\]\s*\[(?P<ref>[^\]]{3,120})\]\s*(?P<org>[^[]+?)(?=(?:\s+\d{1,2}\s+\w{3}-\w{3}|\s+\d{2}[-/]\d{2}[-/]\d{4}|$))",
-        text,
-        flags=re.IGNORECASE,
-    )
-    for title, ref, org in bracket_rows:
-        title = clean_text(title)
-        ref = clean_text(ref)
-        org = clean_text(org)
-        if not title:
-            continue
-        rows.append(
-            Tender(
-                source="CPPP",
-                title=title,
-                ref_no=ref,
-                org=org[:220],
-                url=final_url,
-                summary=" ".join([title, ref, org]),
-            )
-        )
-
-    # Even if regex misses, use raw text snippets around renewable words.
-    for kw in ["solar", "wind", "bess", "battery", "hybrid", "epc", "renewable", "turnkey"]:
-        idx = text.lower().find(kw)
-        if idx != -1:
-            snippet = clean_text(text[max(0, idx-120): idx+260])
-            if len(snippet) > 40:
-                rows.append(Tender(source="CPPP", title=snippet[:220], summary=snippet, url=final_url))
-    return dedupe_tenders(rows)
-
-def fetch_source(source_cfg: Dict, session: requests.Session) -> Tuple[str, List[Tender], str]:
-    name = source_cfg["name"]
-    kind = source_cfg["kind"]
-    try:
-        if kind == "seci":
-            rows = scrape_seci(session)
-        elif kind == "ntpc":
-            rows = scrape_ntpc(session)
-        elif kind == "nhpc":
-            rows = scrape_nhpc(session)
-        elif kind == "sjvn":
-            rows = scrape_sjvn(session)
-        elif kind == "cppp":
-            rows = scrape_cppp(session)
-        else:
-            rows = []
-        return name, rows, ""
-    except Exception as e:
-        return name, [], f"{type(e).__name__}: {e}"
-
-def enrich_rows(rows: List[Tender], query: str, min_score: int, include_closed: bool) -> List[Tender]:
-    kept = []
-    for t in rows:
-        blob = " ".join([t.title, t.summary, t.ref_no, t.org, t.location]).lower()
-        renewable_score, renewable_found = contains_relevant_keywords(blob, RENEWABLE_KEYWORDS)
-        query_score = 0
-        query_found = []
-        if query:
-            qscore, qfound = contains_relevant_keywords(blob, [query])
-            query_score = qscore
-            query_found = qfound
-        t.score = max(t.score, renewable_score, query_score)
-        if renewable_found:
-            t.matched_keywords = ", ".join(sorted(set(renewable_found)))
-        elif query_found:
-            t.matched_keywords = ", ".join(sorted(set(query_found)))
-        if should_keep_tender(t, include_closed=include_closed, query=query, min_score=min_score):
-            kept.append(t)
-    return dedupe_tenders(kept)
-
-def to_dataframe(rows: List[Tender]) -> pd.DataFrame:
-    if not rows:
-        return pd.DataFrame(columns=[
-            "source", "title", "closing_date", "publish_date", "ref_no", "org",
-            "location", "url", "summary", "score", "matched_keywords"
-        ])
-    df = pd.DataFrame([asdict(t) for t in rows])
-    desired = [
-        "source", "title", "closing_date", "publish_date", "ref_no", "org",
-        "location", "url", "summary", "score", "matched_keywords"
-    ]
-    for c in desired:
-        if c not in df.columns:
-            df[c] = ""
-    df = df[desired]
-    return df
-
-def export_excel(df: pd.DataFrame) -> bytes:
-    from io import BytesIO
-    buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+def to_excel_bytes(df):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Tenders")
-    return buffer.getvalue()
+    buf.seek(0)
+    return buf.getvalue()
 
-def humanize_seconds(value: float) -> str:
-    if value < 1:
-        return f"{int(value * 1000)} ms"
-    return f"{value:.2f} s"
+# ---------------------------------------------------------------------------
+# STREAMLIT UI
+# ---------------------------------------------------------------------------
 
-def render_sidebar():
-    st.sidebar.header("Filters")
-    selected_sources = st.sidebar.multiselect(
-        "Sources",
-        [s["name"] for s in SOURCE_CONFIGS],
-        default=[s["name"] for s in SOURCE_CONFIGS],
+def init_state():
+    st.session_state.setdefault("health_df", None)
+    st.session_state.setdefault("tenders_df", None)
+    st.session_state.setdefault("logs", [])
+    st.session_state.setdefault("scan_meta", {})
+    st.session_state.setdefault("debug_records", [])
+    st.session_state.setdefault("validation_df", None)
+
+
+def sidebar_controls():
+    st.sidebar.header("⚙️ Scan Configuration")
+
+    st.sidebar.subheader("Source Groups")
+    chosen_groups = st.sidebar.multiselect(
+        "Groups", options=SOURCE_GROUPS, default=SOURCE_GROUPS,
     )
-    query = st.sidebar.text_input("Keyword filter", value="solar")
-    include_closed = st.sidebar.checkbox("Include closed tenders", value=False)
-    min_score = st.sidebar.slider("Minimum relevance score", 1, 15, 2)
-    max_rows = st.sidebar.slider("Rows to show", 10, 500, 100, step=10)
-    auto_refresh = st.sidebar.checkbox("Auto-refresh (rerun on open)", value=False)
-    refresh_interval = st.sidebar.number_input("Refresh interval minutes", min_value=1, max_value=240, value=60)
-    return selected_sources, query, include_closed, min_score, max_rows, auto_refresh, refresh_interval
+    group_filtered = [s for s in SOURCE_REGISTRY if s["group"] in chosen_groups]
 
-def fetch_all(selected_sources: List[str]) -> Tuple[List[Tender], Dict[str, Dict]]:
-    session = get_session()
-    chosen = [s for s in SOURCE_CONFIGS if s["name"] in selected_sources]
-    results: List[Tender] = []
-    status: Dict[str, Dict] = {}
+    st.sidebar.subheader("Source Selection")
+    all_names = [s["name"] for s in group_filtered]
+    select_all = st.sidebar.checkbox("Select all sources in groups", value=True)
+    chosen_names = st.sidebar.multiselect(
+        "Sources",
+        options=all_names,
+        default=all_names if select_all else [],
+    )
+    selected_sources = [s for s in group_filtered if s["name"] in chosen_names]
 
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(chosen)))) as ex:
-        futures = {ex.submit(fetch_source, src, session): src for src in chosen}
+    st.sidebar.subheader("Search Keywords")
+    kw_raw = st.sidebar.text_input(
+        "Keywords (comma separated)", value="solar, wind, storage, hybrid"
+    )
+    keywords = [k.strip() for k in kw_raw.split(",") if k.strip()]
+
+    st.sidebar.subheader("Technology Filters")
+    tech_filters = []
+    cols = st.sidebar.columns(2)
+    flags = {
+        "Solar": cols[0].checkbox("Solar", value=True),
+        "Wind": cols[1].checkbox("Wind", value=True),
+        "BESS": cols[0].checkbox("BESS", value=True),
+        "Hybrid": cols[1].checkbox("Hybrid", value=True),
+        "EPC": cols[0].checkbox("EPC", value=False),
+        "Transmission": cols[1].checkbox("Transmission", value=False),
+    }
+    tech_filters = [t for t, on in flags.items() if on]
+
+    st.sidebar.subheader("Performance & Behaviour")
+    deep_scan = st.sidebar.toggle("Deep Scan (follow detail pages)", value=False)
+    max_detail = st.sidebar.slider("Max Detail Pages (deep scan)", 0, 20, 5)
+    timeout = st.sidebar.slider("Timeout (seconds)", 3, 60, 15)
+    retries = st.sidebar.slider("Retries per source", 0, 3, 1)
+    workers = st.sidebar.slider("Parallel workers", 1, 32, 12)
+    max_results = st.sidebar.slider("Max results to display", 50, 5000, 1000, step=50)
+    debug = st.sidebar.toggle("🐞 Debug Mode", value=False)
+
+    return {
+        "selected_sources": selected_sources,
+        "keywords": keywords,
+        "tech_filters": tech_filters,
+        "deep_scan": deep_scan,
+        "max_detail": max_detail,
+        "timeout": timeout,
+        "retries": retries,
+        "workers": workers,
+        "max_results": max_results,
+        "debug": debug,
+    }
+
+
+def deep_scan_source(record, keywords, tech_filters, timeout, retries, max_detail, debug):
+    """
+    Optional: visit up to max_detail tender URLs from a source and re-extract
+    richer text. Returns enriched tenders list (best-effort, failures reported).
+    """
+    enriched = list(record["tenders"])
+    if max_detail <= 0:
+        return enriched
+    detail_urls = []
+    for t in record["tenders"]:
+        u = t.get("URL", "")
+        if u and u != record["final_url"] and urlparse(u).scheme in ("http", "https"):
+            detail_urls.append(u)
+    detail_urls = list(dict.fromkeys(detail_urls))[:max_detail]
+    for u in detail_urls:
+        fetched = fetch_url(u, timeout=timeout, retries=retries)
+        if not fetched["ok"]:
+            continue
+        soup = BeautifulSoup(fetched["html"], "html.parser")
+        page_text = _clean(soup.get_text())[:5000]
+        # update the matching tender record with better dates/number/score
+        for t in enriched:
+            if t["URL"] == u:
+                num = extract_tender_number(page_text)
+                if num:
+                    t["Tender Number"] = num
+                iss, cls = extract_dates(page_text)
+                if iss:
+                    t["Issue Date"] = iss
+                if cls:
+                    t["Closing Date"] = cls
+                t["Match Score"] = max(
+                    t["Match Score"],
+                    compute_match_score(page_text, keywords, tech_filters),
+                )
+    return enriched
+
+
+def run_scan(cfg, log_placeholder, progress_bar, status_text):
+    sources = cfg["selected_sources"]
+    logs = []
+    health_rows = []
+    all_tenders = []
+    debug_records = []
+
+    start_all = time.time()
+    completed = 0
+    total = len(sources)
+
+    with ThreadPoolExecutor(max_workers=cfg["workers"]) as pool:
+        futures = {
+            pool.submit(
+                scan_source, s, cfg["keywords"], cfg["tech_filters"],
+                cfg["timeout"], cfg["retries"], cfg["debug"],
+            ): s
+            for s in sources
+        }
         for fut in as_completed(futures):
             src = futures[fut]
-            start = time.time()
-            name = src["name"]
             try:
-                source_name, rows, err = fut.result(timeout=DEFAULT_TIMEOUT * 2)
-                elapsed = time.time() - start
-                if err:
-                    status[name] = {"ok": False, "count": 0, "elapsed": elapsed, "error": err}
-                else:
-                    status[name] = {"ok": True, "count": len(rows), "elapsed": elapsed, "error": ""}
-                    results.extend(rows)
-            except Exception as e:
-                elapsed = time.time() - start
-                status[name] = {"ok": False, "count": 0, "elapsed": elapsed, "error": f"{type(e).__name__}: {e}"}
-    return dedupe_tenders(results), status
+                rec = fut.result()
+            except Exception as exc:
+                rec = {
+                    "source": src["name"], "group": src["group"], "url": src["url"],
+                    "final_url": src["url"], "status": None, "status_label": "Failed",
+                    "response_time": 0.0, "redirected": False,
+                    "extraction_success": False, "tender_count": 0,
+                    "error": f"ScanCrash: {exc.__class__.__name__}: {exc}",
+                    "traceback": traceback.format_exc(), "tenders": [],
+                    "debug": {}, "log": [f"[START] {src['name']}", "[ERROR] scan crashed", "[DONE]"],
+                }
 
-def render_health(status: Dict[str, Dict]):
-    cols = st.columns(len(SOURCE_CONFIGS))
-    for col, src in zip(cols, SOURCE_CONFIGS):
-        info = status.get(src["name"], {})
-        ok = info.get("ok", False)
-        count = info.get("count", 0)
-        elapsed = info.get("elapsed", 0.0)
-        err = info.get("error", "")
-        with col:
-            st.metric(
-                label=src["name"],
-                value=f"{count} rows" if ok else "failed",
-                delta=humanize_seconds(elapsed) if elapsed else None,
-            )
-            if err:
-                st.caption(err[:140])
+            # Optional deep scan
+            if cfg["deep_scan"] and rec["tenders"]:
+                try:
+                    rec["tenders"] = deep_scan_source(
+                        rec, cfg["keywords"], cfg["tech_filters"],
+                        cfg["timeout"], cfg["retries"], cfg["max_detail"], cfg["debug"],
+                    )
+                    rec["tender_count"] = len(rec["tenders"])
+                except Exception as exc:
+                    rec["log"].append(f"[ERROR] deep scan: {exc.__class__.__name__}")
+
+            logs.extend(rec["log"])
+            health_rows.append({
+                "Source": rec["source"],
+                "URL": rec["url"],
+                "HTTP Status": rec["status"] if rec["status"] is not None else "—",
+                "Response Time (s)": rec["response_time"],
+                "Redirected": "Yes" if rec["redirected"] else "No",
+                "Extraction Success": "Yes" if rec["extraction_success"] else "No",
+                "Tender Count": rec["tender_count"],
+                "Health": rec["status_label"] or "Failed",
+                "Error Message": rec["error"],
+            })
+            all_tenders.extend(rec["tenders"])
+            if cfg["debug"]:
+                debug_records.append(rec)
+
+            completed += 1
+            progress_bar.progress(completed / max(1, total))
+            status_text.write(f"Scanned **{completed}/{total}** sources…")
+            # Real-time log window (show last 60 lines to stay light)
+            log_placeholder.code("\n".join(logs[-60:]) or "(waiting…)", language="text")
+
+    total_time = round(time.time() - start_all, 2)
+
+    health_df = pd.DataFrame(health_rows)
+    if not health_df.empty:
+        health_df = health_df.sort_values(
+            by=["Tender Count", "Response Time (s)"], ascending=[False, True]
+        ).reset_index(drop=True)
+
+    tenders_df = pd.DataFrame(all_tenders)
+    if not tenders_df.empty:
+        tenders_df = tenders_df.drop_duplicates(
+            subset=["Tender Title", "URL"]
+        ).sort_values(by="Match Score", ascending=False).reset_index(drop=True)
+        tenders_df = tenders_df.head(cfg["max_results"])
+
+    meta = {
+        "configured": len(SOURCE_REGISTRY),
+        "selected": len(sources),
+        "successful": int((health_df["Health"] == "Success").sum()) if not health_df.empty else 0,
+        "partial": int((health_df["Health"] == "Partial").sum()) if not health_df.empty else 0,
+        "failed": int((health_df["Health"] == "Failed").sum()) if not health_df.empty else 0,
+        "total_tenders": len(tenders_df),
+        "total_time": total_time,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    st.session_state["health_df"] = health_df
+    st.session_state["tenders_df"] = tenders_df
+    st.session_state["logs"] = logs
+    st.session_state["scan_meta"] = meta
+    st.session_state["debug_records"] = debug_records
+
+
+def render_summary(meta):
+    st.subheader("📊 Scan Summary")
+    c = st.columns(6)
+    c[0].metric("Configured", meta.get("configured", 0))
+    c[1].metric("Selected", meta.get("selected", 0))
+    c[2].metric("Successful", meta.get("successful", 0))
+    c[3].metric("Partial", meta.get("partial", 0))
+    c[4].metric("Failed", meta.get("failed", 0))
+    c[5].metric("Tenders", meta.get("total_tenders", 0))
+    st.caption(
+        f"⏱️ Total scan time: **{meta.get('total_time', 0)} s**  ·  "
+        f"Run at {meta.get('timestamp', '')}"
+    )
+
+
+def render_health(health_df):
+    st.subheader("🩺 Source Health")
+    if health_df is None or health_df.empty:
+        st.info("No scan run yet.")
+        return
+    styled = health_df.style.applymap(color_health, subset=["Health"])
+    st.dataframe(styled, use_container_width=True, height=420)
+
+
+def render_results(tenders_df):
+    st.subheader("📑 Tender Results")
+    if tenders_df is None or tenders_df.empty:
+        st.info("No tenders extracted in the last scan.")
+        return
+
+    f1, f2, f3 = st.columns([2, 2, 1])
+    search = f1.text_input("🔍 Search title / number / location")
+    tech_opt = sorted({
+        t.strip()
+        for row in tenders_df["Technology"].astype(str)
+        for t in row.split(",")
+        if t.strip()
+    })
+    tech_pick = f2.multiselect("Technology", options=tech_opt)
+    min_score = f3.slider("Min score", 0, 100, 0)
+
+    view = tenders_df.copy()
+    if search:
+        s = search.lower()
+        mask = (
+            view["Tender Title"].astype(str).str.lower().str.contains(s, na=False)
+            | view["Tender Number"].astype(str).str.lower().str.contains(s, na=False)
+            | view["Location"].astype(str).str.lower().str.contains(s, na=False)
+            | view["Source"].astype(str).str.lower().str.contains(s, na=False)
+        )
+        view = view[mask]
+    if tech_pick:
+        view = view[view["Technology"].apply(
+            lambda x: any(t in str(x) for t in tech_pick)
+        )]
+    view = view[view["Match Score"] >= min_score]
+
+    st.caption(f"Showing **{len(view)}** of {len(tenders_df)} tenders")
+    st.dataframe(
+        view,
+        use_container_width=True,
+        height=520,
+        column_config={
+            "URL": st.column_config.LinkColumn("URL"),
+            "Match Score": st.column_config.ProgressColumn(
+                "Match Score", min_value=0, max_value=100, format="%d"
+            ),
+        },
+    )
+
+    d1, d2 = st.columns(2)
+    d1.download_button(
+        "⬇️ Download CSV",
+        data=view.to_csv(index=False).encode("utf-8"),
+        file_name=f"tenders_{datetime.now():%Y%m%d_%H%M%S}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    d2.download_button(
+        "⬇️ Download Excel",
+        data=to_excel_bytes(view),
+        file_name=f"tenders_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+
+def render_debug(debug_records):
+    st.subheader("🐞 Debug Output")
+    if not debug_records:
+        st.info("Enable Debug Mode and run a scan to see per-source internals.")
+        return
+    for rec in debug_records:
+        with st.expander(
+            f"{rec['source']}  ·  HTTP {rec['status']}  ·  "
+            f"{rec['tender_count']} tenders  ·  {rec['status_label']}"
+        ):
+            st.write(f"**Final URL:** {rec['final_url']}")
+            st.write(f"**Response time:** {rec['response_time']} s  ·  "
+                     f"**Redirected:** {rec['redirected']}")
+            if rec["error"]:
+                st.error(f"Error: {rec['error']}")
+            dbg = rec.get("debug", {}) or {}
+            if dbg.get("strategies"):
+                st.write("**Strategy hit counts:**", dbg["strategies"])
+            if dbg.get("links"):
+                st.write("**Discovered links (first 50):**")
+                st.code("\n".join(dbg["links"]), language="text")
+            if dbg.get("html_preview"):
+                st.write("**HTML preview (3k chars):**")
+                st.code(dbg["html_preview"], language="html")
+            if dbg.get("text_preview"):
+                st.write("**Extracted text preview (3k chars):**")
+                st.code(dbg["text_preview"], language="text")
+            if rec.get("traceback"):
+                st.write("**Traceback:**")
+                st.code(rec["traceback"], language="text")
+
+
+def render_validation_tab(cfg):
+    st.subheader("✅ Source Validation")
+    st.caption(
+        "Lightweight reachability check across the registry. "
+        "Working = HTTP 200, Redirected = 3xx / final URL differs, Broken = error / non-200."
+    )
+    if st.button("Run Source Validation", type="secondary"):
+        with st.spinner("Validating sources…"):
+            df = run_validation(SOURCE_REGISTRY, cfg["timeout"], cfg["workers"])
+        st.session_state["validation_df"] = df
+
+    df = st.session_state.get("validation_df")
+    if df is not None and not df.empty:
+        v = st.columns(4)
+        v[0].metric("Configured", len(df))
+        v[1].metric("Working", int((df["State"] == "Working").sum()))
+        v[2].metric("Redirected", int((df["State"] == "Redirected").sum()))
+        v[3].metric("Broken", int((df["State"] == "Broken").sum()))
+        styled = df.style.applymap(color_health, subset=["State"])
+        st.dataframe(styled, use_container_width=True, height=480)
+        st.download_button(
+            "⬇️ Download Validation CSV",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name="source_validation.csv",
+            mime="text/csv",
+        )
+
 
 def main():
-    init_page()
-    create_db()
+    st.set_page_config(page_title="Renewable Tender Intelligence", layout="wide")
+    init_state()
 
-    selected_sources, query, include_closed, min_score, max_rows, auto_refresh, refresh_interval = render_sidebar()
+    st.title(APP_TITLE)
+    st.caption(
+        "Live, parallel scanning of Indian renewable tender sources — "
+        "Solar · Wind · BESS · Hybrid · Transmission · EPC. "
+        "Free tooling only (requests + BeautifulSoup). Full transparency: every "
+        "HTTP status, timing and error is shown."
+    )
 
-    col1, col2, col3 = st.columns([1, 1, 2])
-    with col1:
-        refresh = st.button("Refresh now", type="primary")
-    with col2:
-        use_cache = st.checkbox("Show last cached data too", value=True)
-    with col3:
-        st.info(
-            "This file scans official public tender pages and keeps running even if one source fails."
+    cfg = sidebar_controls()
+
+    top = st.columns([1, 1, 4])
+    scan_clicked = top[0].button("🚀 SCAN", type="primary", use_container_width=True)
+    clear_clicked = top[1].button("🧹 Clear", use_container_width=True)
+    top[2].caption(
+        f"Registry: **{len(SOURCE_REGISTRY)}** sources configured  ·  "
+        f"**{len(cfg['selected_sources'])}** selected for scan"
+    )
+
+    if clear_clicked:
+        for k in ("health_df", "tenders_df", "logs", "scan_meta", "debug_records"):
+            st.session_state[k] = None if k.endswith("df") else (
+                [] if k in ("logs", "debug_records") else {}
+            )
+        st.rerun()
+
+    log_area = st.container()
+    with log_area:
+        st.subheader("📟 Live Log")
+        log_placeholder = st.empty()
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
+
+    if scan_clicked:
+        if not cfg["selected_sources"]:
+            st.warning("Select at least one source in the sidebar.")
+        else:
+            log_placeholder.code("(starting scan…)", language="text")
+            run_scan(cfg, log_placeholder, progress_bar, status_text)
+            status_text.write("✅ Scan complete.")
+    else:
+        prior = st.session_state.get("logs") or []
+        log_placeholder.code(
+            "\n".join(prior[-60:]) if prior else "(no scan yet — press SCAN)",
+            language="text",
         )
 
-    if auto_refresh:
-        st.caption(f"Auto-refresh mode enabled: re-run manually every {refresh_interval} minutes.")
+    tabs = st.tabs(["📊 Summary & Health", "📑 Results", "🐞 Debug", "✅ Validation"])
 
-    should_run = refresh or "tender_snapshot" not in st.session_state
-    if should_run:
-        with st.spinner("Fetching live tender pages..."):
-            tenders, status = fetch_all(selected_sources)
-            tenders = enrich_rows(tenders, query=query, min_score=min_score, include_closed=include_closed)
-            tenders = dedupe_tenders(tenders)
-            tenders = sorted(
-                tenders,
-                key=lambda t: (
-                    -(t.score or 0),
-                    t.closing_date if t.closing_date else "9999-12-31",
-                    t.source,
-                    t.title,
-                ),
-            )
-            st.session_state["tender_snapshot"] = tenders
-            st.session_state["fetch_status"] = status
-            save_cache(tenders)
-            st.session_state["fetched_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    else:
-        tenders = st.session_state.get("tender_snapshot", [])
-        status = st.session_state.get("fetch_status", {})
+    with tabs[0]:
+        if st.session_state.get("scan_meta"):
+            render_summary(st.session_state["scan_meta"])
+        render_health(st.session_state.get("health_df"))
 
-    if use_cache:
-        cached_df = load_cache()
-        if not cached_df.empty:
-            st.sidebar.success(f"Cached records: {len(cached_df)}")
+    with tabs[1]:
+        render_results(st.session_state.get("tenders_df"))
 
-    render_health(status)
+    with tabs[2]:
+        render_debug(st.session_state.get("debug_records") or [])
 
-    df = to_dataframe(tenders)
+    with tabs[3]:
+        render_validation_tab(cfg)
 
-    if query:
-        q = query.lower().strip()
-        if q:
-            df = df[
-                df["title"].astype(str).str.lower().str.contains(q, na=False)
-                | df["summary"].astype(str).str.lower().str.contains(q, na=False)
-                | df["ref_no"].astype(str).str.lower().str.contains(q, na=False)
-            ].copy()
-
-    if not include_closed and not df.empty and "closing_date" in df.columns:
-        today_iso = date.today().isoformat()
-        df["__closing"] = df["closing_date"].fillna("").astype(str)
-        mask = (df["__closing"] == "") | (df["__closing"] >= today_iso)
-        df = df.loc[mask].copy()
-        df.drop(columns=["__closing"], inplace=True, errors="ignore")
-
-    total = len(df)
-    cols = st.columns(4)
-    cols[0].metric("Matched tenders", total)
-    cols[1].metric("Sources checked", len(selected_sources))
-    cols[2].metric("Keyword", query or "—")
-    cols[3].metric("Last refresh", st.session_state.get("fetched_at", "—"))
-
-    if df.empty:
-        st.warning("No matching tenders found for the current filters.")
-    else:
-        display_df = df.head(max_rows).copy()
-        for c in ["closing_date", "publish_date"]:
-            if c in display_df.columns:
-                display_df[c] = display_df[c].fillna("")
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        csv_bytes = display_df.to_csv(index=False).encode("utf-8")
-        xlsx_bytes = export_excel(display_df)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button(
-                "Download CSV",
-                data=csv_bytes,
-                file_name="renewable_epc_tenders.csv",
-                mime="text/csv",
-            )
-        with c2:
-            st.download_button(
-                "Download Excel",
-                data=xlsx_bytes,
-                file_name="renewable_epc_tenders.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-        st.subheader("Open links")
-        for _, row in display_df.head(25).iterrows():
-            title = clean_text(str(row.get("title", "")))
-            url = clean_text(str(row.get("url", "")))
-            source = clean_text(str(row.get("source", "")))
-            closing = clean_text(str(row.get("closing_date", "")))
-            st.markdown(f"- **{source}** | {title} | {closing} | {url}")
-
-    with st.expander("Debug / source snapshot"):
-        st.write("Selected sources:", selected_sources)
-        st.write("Status:", status)
-        st.write("Raw row count:", len(tenders))
-        if tenders:
-            st.json([asdict(t) for t in tenders[:5]])
-
-    st.caption("Tip: run this with `streamlit run app.py`.")
 
 if __name__ == "__main__":
     main()
