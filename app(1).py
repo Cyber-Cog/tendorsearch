@@ -118,7 +118,8 @@ SOURCE_REGISTRY = [
     _src("RECPDCL", "Central", "https://www.recpdcl.in/tenders"),
     _src("PFCCL", "Central", "https://pfcclindia.com/Home/Tenders"),
     _src("CPPP", "Central", "https://eprocure.gov.in/cppp/latestactivetendersnew/cpppdata"),
-    _src("GeM", "Central", "https://bidplus.gem.gov.in/all-bids"),
+    {"name": "GeM", "group": "Central",
+     "url": "https://bidplus.gem.gov.in/all-bids", "kind": "gem"},
     _src("GAIL", "Central", "https://gailtenders.in/"),
     _src("IOCL", "Central", "https://iocletenders.nic.in/nicgep/app"),
     _src("BPCL", "Central", "https://bpcl.in/tenders"),
@@ -517,9 +518,208 @@ def extract_tenders(html, source, base_url, keywords, tech_filters,
 # PER-SOURCE SCAN  (runs inside worker thread; returns plain dict only)
 # ---------------------------------------------------------------------------
 
+def scan_gem(source, keywords, tech_filters, timeout, strict_tech,
+             exclude_noise, require_signal, debug):
+    """
+    Dedicated scraper for GeM (Government e-Marketplace) bid listing.
+
+    GeM's /all-bids page is JavaScript-driven, but it loads data from a JSON
+    endpoint (/all-bids-data) that accepts a plain POST once you supply the
+    CSRF token. We GET the page first (to obtain cookies + token), then POST a
+    search for each keyword. No browser required.
+
+    IMPORTANT: GeM has bot protection. From a foreign / datacenter IP (e.g.
+    Streamlit Cloud) this will often return 403 or an empty challenge page.
+    It is far more likely to work when the app is run locally on an Indian IP.
+    All outcomes are reported honestly (status, error) -- nothing is hidden.
+    """
+    log_lines = [f"[START] {source['name']}"]
+    record = {
+        "source": source["name"], "group": source["group"], "url": source["url"],
+        "final_url": source["url"], "status": None, "status_label": "",
+        "response_time": 0.0, "redirected": False, "extraction_success": False,
+        "tender_count": 0, "error": "", "traceback": "", "tenders": [],
+        "debug": {}, "log": log_lines,
+    }
+    start = time.time()
+    sess = build_session()
+    base = "https://bidplus.gem.gov.in/all-bids"
+    data_url = "https://bidplus.gem.gov.in/all-bids-data"
+    try:
+        # Step 1: GET the listing page for cookies + CSRF token.
+        page = sess.get(base, timeout=timeout)
+        record["status"] = page.status_code
+        log_lines.append(f"[HTTP] {page.status_code} ({round(time.time()-start,2)}s)")
+        if page.status_code != 200:
+            record["error"] = f"HTTP {page.status_code} on listing page"
+            record["status_label"] = "Failed"
+            log_lines.append("[DONE]")
+            record["response_time"] = round(time.time() - start, 3)
+            return record
+
+        soup = BeautifulSoup(page.text, "html.parser")
+        token = ""
+        meta = soup.find("meta", attrs={"name": "csrf-token"})
+        if meta and meta.get("content"):
+            token = meta["content"]
+        if not token:
+            inp = soup.find("input", attrs={"name": ["csrf_bd_gem_nk", "_csrf_token", "csrf_token"]})
+            if inp and inp.get("value"):
+                token = inp["value"]
+        if not token:
+            token = sess.cookies.get("csrf_bd_gem_cookie", "") or sess.cookies.get("ci_session", "")
+        log_lines.append(f"[TOKEN] {'found' if token else 'NOT found'}")
+
+        # Step 2: query each keyword (and each selected technology name).
+        queries = list(dict.fromkeys(
+            [k for k in keywords if k] + [t for t in tech_filters]
+        )) or ["solar"]
+        all_recs = []
+        raw_preview = ""
+        for q in queries[:8]:
+            payload = {
+                "payload": '{"page":1,"param":{"searchBid":"%s","searchType":"fullText"},'
+                           '"filter":{"bidStatusType":"ongoing_bids","byType":"all",'
+                           '"highBidValue":"","byEndDate":{"from":"","to":""},'
+                           '"sort":"Bid-Start-Date-Latest"}}' % q.replace('"', ""),
+                "csrf_bd_gem_nk": token,
+            }
+            headers = {
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": base,
+                "Origin": "https://bidplus.gem.gov.in",
+            }
+            try:
+                resp = sess.post(data_url, data=payload, headers=headers, timeout=timeout)
+            except Exception as exc:
+                log_lines.append(f"[ERROR] POST '{q}': {exc.__class__.__name__}")
+                continue
+            if resp.status_code != 200:
+                log_lines.append(f"[WARN] '{q}' -> HTTP {resp.status_code}")
+                continue
+            if not raw_preview:
+                raw_preview = resp.text[:2000]
+            # Parse JSON defensively (schema may evolve).
+            try:
+                data = resp.json()
+            except Exception:
+                log_lines.append(f"[WARN] '{q}' -> non-JSON response (likely blocked)")
+                continue
+            docs = _gem_find_docs(data)
+            for d in docs:
+                blob = " ".join(str(v) for v in _flatten_values(d))
+                if not blob.strip():
+                    continue
+                rec = _make_record(source, _gem_title(d, blob),
+                                   _gem_url(d), blob, keywords, tech_filters)
+                all_recs.append(rec)
+            log_lines.append(f"[PARSE] '{q}' -> {len(docs)} bids")
+
+        # Dedup + filter consistently with the rest of the app.
+        seen, deduped = set(), []
+        for r in all_recs:
+            key = (r["Tender Title"].lower()[:120], r["Tender Number"])
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(r)
+        kept = [r for r in deduped
+                if _passes_filters(r, tech_filters, strict_tech, exclude_noise, require_signal)]
+
+        record["tenders"] = kept
+        record["tender_count"] = len(kept)
+        record["extraction_success"] = len(kept) > 0
+        record["status_label"] = "Success" if kept else "Partial"
+        record["response_time"] = round(time.time() - start, 3)
+        if debug:
+            record["debug"] = {"strategies": {"gem_json_bids": len(deduped)},
+                               "html_preview": raw_preview, "text_preview": "",
+                               "links": [], "filtered_out": len(deduped) - len(kept)}
+        log_lines.append(f"[TOTAL] {len(kept)} tenders after filtering")
+        if not kept:
+            log_lines.append("[WARN] 0 kept -- GeM likely blocked this IP "
+                             "(try running locally) or schema changed")
+    except requests.exceptions.Timeout:
+        record["error"] = f"Timeout after {timeout}s"
+        record["status_label"] = "Failed"
+        log_lines.append("[TIMEOUT]")
+    except Exception as exc:
+        record["error"] = f"{exc.__class__.__name__}: {exc}"
+        record["traceback"] = traceback.format_exc()
+        record["status_label"] = "Failed"
+        log_lines.append(f"[ERROR] {record['error']}")
+    finally:
+        try:
+            sess.close()
+        except Exception:
+            pass
+    log_lines.append("[DONE]")
+    return record
+
+
+def _flatten_values(obj):
+    """Yield all scalar values from a nested dict/list (for text blobs)."""
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _flatten_values(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _flatten_values(v)
+    else:
+        yield obj
+
+
+def _gem_find_docs(data):
+    """Locate the list of bid documents in GeM's JSON, tolerant of schema drift."""
+    # Known shape: data['response']['response']['docs'] -> list of dicts.
+    node = data
+    for key in ("response", "response", "docs"):
+        if isinstance(node, dict) and key in node:
+            node = node[key]
+    if isinstance(node, list):
+        return node
+    # Fallback: deep-search for the first list of dicts.
+    def walk(o):
+        if isinstance(o, list) and o and isinstance(o[0], dict):
+            return o
+        if isinstance(o, dict):
+            for v in o.values():
+                r = walk(v)
+                if r:
+                    return r
+        return None
+    return walk(data) or []
+
+
+def _gem_title(doc, blob):
+    for k in ("b_category_name", "b_bid_number", "ba_official_details_minName",
+              "category_name", "title", "name"):
+        v = doc.get(k) if isinstance(doc, dict) else None
+        if isinstance(v, list) and v:
+            return _clean(str(v[0]))
+        if isinstance(v, str) and v:
+            return _clean(v)
+    return _clean(blob)[:160]
+
+
+def _gem_url(doc):
+    if isinstance(doc, dict):
+        for k in ("b_id", "id", "bid_id"):
+            v = doc.get(k)
+            if isinstance(v, list) and v:
+                v = v[0]
+            if v:
+                return f"https://bidplus.gem.gov.in/showbidDocument/{v}"
+    return "https://bidplus.gem.gov.in/all-bids"
+
+
 def scan_source(source, keywords, tech_filters, timeout, retries, debug,
                 strict_tech=True, exclude_noise=True, require_signal=False):
     """Fetch + extract a single source. Returns a fully-populated record dict."""
+    # Dispatch to a dedicated scraper for special source kinds.
+    if source.get("kind") == "gem":
+        return scan_gem(source, keywords, tech_filters, timeout, strict_tech,
+                        exclude_noise, require_signal, debug)
     log_lines = [f"[START] {source['name']}"]
     record = {
         "source": source["name"],
@@ -716,10 +916,10 @@ def sidebar_controls():
         help="Drops recruitment ads, holiday lists, transfer/result notices, etc.",
     )
     require_signal = st.sidebar.checkbox(
-        "Require explicit tender signal", value=True,
-        help="Keeps only items with a tender keyword, tender number, or procurement "
-             "verb (e.g. 'supply of'). Removes news headlines and nav links from "
-             "corporate sites. Turn off if it filters out real tenders you expect.",
+        "Require explicit tender signal", value=False,
+        help="Strict: keeps only items with a tender keyword, tender number, or "
+             "procurement verb. Removes news/nav noise but can also drop real "
+             "tenders with bare titles. Off by default; turn on if you see too much noise.",
     )
 
     st.sidebar.subheader("Performance & Behaviour")
@@ -1045,6 +1245,19 @@ def main():
         "Free tooling only (requests + BeautifulSoup). Full transparency: every "
         "HTTP status, timing and error is shown."
     )
+    with st.expander("ℹ️ Realistic expectations — please read", expanded=False):
+        st.markdown(
+            "- This is **not** an aggregator like TenderTiger. Those serve a "
+            "years-deep database filled by 24/7 crawlers + headless browsers; "
+            "this does one live HTTP scan with no storage, so coverage is far smaller.\n"
+            "- **Run locally for best results** (`streamlit run app.py`). Government "
+            "portals (GeM, SECI, NIC state sites) often **block Streamlit Cloud's "
+            "datacenter IP**. Your own Indian IP is much more likely to get data.\n"
+            "- Big **EPC tenders** (e.g. 300 MW BESS) live on JavaScript/CAPTCHA "
+            "portals that `requests` cannot read — those need a browser.\n"
+            "- GeM is included via its JSON endpoint and is the best free source for "
+            "solar/battery **goods** tenders, when not IP-blocked."
+        )
 
     cfg = sidebar_controls()
 
